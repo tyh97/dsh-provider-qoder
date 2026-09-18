@@ -9,8 +9,10 @@ import {
 } from './endpoints.ts'
 import type {
   QoderAccountInfo,
+  QoderLocalizedText,
   QoderQuota,
   QoderQuotaUsage,
+  QoderResourcePackage,
   QoderSubscriberFeatureAllowed,
   QoderSubscriberOrganization,
   QoderSubscriberPlan,
@@ -52,6 +54,7 @@ interface RawQuota {
 interface RawUsageInfo {
   userQuota?: RawQuota
   orgResourcePackage?: RawQuota
+  dedicatedResourcePackages?: unknown
   totalUsagePercentage?: number
   isQuotaExceeded?: boolean
   expiresAt?: number | string
@@ -113,6 +116,66 @@ function asNumber(value: unknown): number | undefined {
     if (Number.isFinite(num)) return num
   }
   return undefined
+}
+
+/**
+ * The provider names a resource package with internal identifiers (campaign
+ * ids) that must never reach the UI, so the subscriber-facing copy only ever
+ * comes from `displayLabels`.
+ */
+function findDisplayLabel(raw: unknown, dimension: string): unknown {
+  if (!Array.isArray(raw)) return undefined
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue
+    const obj = entry as Record<string, unknown>
+    if (asString(obj.dimension) === dimension) return obj
+  }
+  return undefined
+}
+
+function normalizeLocalizedText(raw: unknown): QoderLocalizedText | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const obj = raw as Record<string, unknown>
+  const values: Record<string, string> = {}
+  const localized = obj.valueI18n ?? obj.value_i18n
+  if (localized && typeof localized === 'object') {
+    for (const [locale, text] of Object.entries(localized as Record<string, unknown>)) {
+      const resolved = asString(text)
+      if (resolved !== undefined) values[locale] = resolved
+    }
+  }
+  const fallback = asString(obj.value)
+  if (fallback === undefined && Object.keys(values).length === 0) return undefined
+  return { values, fallback: fallback ?? '' }
+}
+
+function normalizeResourcePackages(raw: unknown): QoderResourcePackage[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const packages: QoderResourcePackage[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue
+    const obj = entry as Record<string, unknown>
+    const quota = normalizeQuota(obj as RawQuota)
+    // A malformed entry carries no usable size at all: dropping it keeps the
+    // rest of the quota panel readable instead of failing the account read.
+    if (quota === undefined || (quota.total <= 0 && quota.used <= 0 && quota.remaining <= 0)) continue
+    const id = asString(obj.id)
+    const title = normalizeLocalizedText(findDisplayLabel(obj.displayLabels ?? obj.display_labels, 'title'))
+    const description = normalizeLocalizedText(findDisplayLabel(obj.displayLabels ?? obj.display_labels, 'description'))
+    const expiresAt = normalizeExpiresAt(obj.expiresAt as number | string | undefined)
+    const available = asBoolean(obj.available)
+    const status = asString(obj.status)
+    packages.push({
+      ...id !== undefined ? { id } : {},
+      ...title !== undefined ? { title } : {},
+      ...description !== undefined ? { description } : {},
+      ...quota,
+      ...expiresAt !== undefined ? { expiresAt } : {},
+      ...available !== undefined ? { available } : {},
+      ...status !== undefined ? { status } : {},
+    })
+  }
+  return packages.length > 0 ? packages : undefined
 }
 
 function normalizeOrganization(raw: unknown): QoderSubscriberOrganization | undefined {
@@ -291,9 +354,12 @@ export class QoderUsageReader {
       logCategory: 'account.usage',
     })
 
+    const dedicatedResourcePackages = normalizeResourcePackages(data.dedicatedResourcePackages)
+
     return {
       userQuota: normalizeQuota(data.userQuota),
       orgResourcePackage: normalizeQuota(data.orgResourcePackage),
+      ...dedicatedResourcePackages !== undefined ? { dedicatedResourcePackages } : {},
       totalUsagePercentage: typeof data.totalUsagePercentage === 'number' ? data.totalUsagePercentage : undefined,
       isQuotaExceeded: typeof data.isQuotaExceeded === 'boolean' ? data.isQuotaExceeded : false,
       expiresAt: normalizeExpiresAt(data.expiresAt),

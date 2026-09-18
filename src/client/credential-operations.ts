@@ -92,4 +92,9 @@ export type QoderAccountResult =
 export interface QoderCredentialInjected {
   operations: QoderCredentialOperations
   t(key: QoderCredentialCopy, values?: Record<string, string | number>): string
+  /**
+   * Read the active UI locale at render time so a language switch is reflected
+   * immediately; never snapshot it once during plugin setup.
+   */
+  activeLocale(): string
 }
