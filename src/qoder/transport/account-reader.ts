@@ -89,14 +89,16 @@ function normalizeQuota(raw?: RawQuota): QoderQuota | undefined {
 }
 
 
-function normalizeExpiresAt(rawExpires: unknown): string | undefined {
-  const timestamp = typeof rawExpires === 'number'
-    ? rawExpires
-    : (typeof rawExpires === 'string' ? Date.parse(rawExpires) : NaN)
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return undefined
-  const date = new Date(timestamp)
-  // Even finite provider timestamps can exceed JavaScript's Date range.
-  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined
+function normalizeExpiresAt(rawExpires?: number | string): string | undefined {
+  if (rawExpires === undefined || rawExpires === null) return undefined
+  if (typeof rawExpires === 'number' && rawExpires > 0) {
+    return new Date(rawExpires).toISOString()
+  }
+  if (typeof rawExpires === 'string' && rawExpires.length > 0) {
+    const parsed = Date.parse(rawExpires)
+    if (!Number.isNaN(parsed) && parsed > 0) return new Date(parsed).toISOString()
+  }
+  return undefined
 }
 
 function asString(value: unknown): string | undefined {
@@ -160,7 +162,7 @@ function normalizeResourcePackages(raw: unknown): QoderResourcePackage[] | undef
     const id = asString(obj.id)
     const title = normalizeLocalizedText(findDisplayLabel(obj.displayLabels ?? obj.display_labels, 'title'))
     const description = normalizeLocalizedText(findDisplayLabel(obj.displayLabels ?? obj.display_labels, 'description'))
-    const expiresAt = normalizeExpiresAt(obj.expiresAt)
+    const expiresAt = normalizeExpiresAt(obj.expiresAt as number | string | undefined)
     const available = asBoolean(obj.available)
     const status = asString(obj.status)
     packages.push({
@@ -213,8 +215,8 @@ function normalizePlan(raw: unknown): QoderSubscriberPlan | undefined {
 
   const organization = normalizeOrganization(obj.organization)
   const isPersonalVersion = asBoolean(obj.is_personal_version) ?? asBoolean(obj.isPersonalVersion) ?? (organization === undefined)
-  const startDate = normalizeExpiresAt(obj.start_date ?? obj.startDate)
-  const endDate = normalizeExpiresAt(obj.end_date ?? obj.endDate)
+  const startDate = normalizeExpiresAt(obj.start_date as number | string ?? obj.startDate as number | string)
+  const endDate = normalizeExpiresAt(obj.end_date as number | string ?? obj.endDate as number | string)
   const planTier = asString(obj.plan_tier) ?? asString(obj.planTier)
   const isHighestTier = asBoolean(obj.is_highest_tier) ?? asBoolean(obj.isHighestTier)
   const isRenewed = asBoolean(obj.is_renewed) ?? asBoolean(obj.isRenewed)
@@ -231,6 +233,7 @@ function normalizePlan(raw: unknown): QoderSubscriberPlan | undefined {
     ...endDate !== undefined ? { endDate } : {},
     ...organization !== undefined ? { organization } : {},
     ...featureAllowed !== undefined ? { featureAllowed } : {},
+    raw,
   }
 }
 
@@ -247,6 +250,7 @@ function normalizeStatus(raw: unknown): QoderSubscriberStatus | undefined {
     allowByok,
     ...teamAllowByok !== undefined ? { teamAllowByok } : {},
     ...isPrivacyPolicyModifiable !== undefined ? { isPrivacyPolicyModifiable } : {},
+    raw,
   }
 }
 
@@ -359,6 +363,7 @@ export class QoderUsageReader {
       totalUsagePercentage: typeof data.totalUsagePercentage === 'number' ? data.totalUsagePercentage : undefined,
       isQuotaExceeded: typeof data.isQuotaExceeded === 'boolean' ? data.isQuotaExceeded : false,
       expiresAt: normalizeExpiresAt(data.expiresAt),
+      raw: data,
     }
   }
 

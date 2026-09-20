@@ -50,7 +50,6 @@ export interface QoderQuotaUsage {
   totalUsagePercentage?: number
   isQuotaExceeded?: boolean
   expiresAt?: string
-  /** @deprecated Raw provider responses are no longer returned; use normalized fields. */
   raw?: unknown
 }
 
@@ -80,7 +79,6 @@ export interface QoderSubscriberPlan {
   endDate?: string
   organization?: QoderSubscriberOrganization
   featureAllowed?: QoderSubscriberFeatureAllowed
-  /** @deprecated Raw provider responses are no longer returned; use normalized fields. */
   raw?: unknown
 }
 
@@ -88,7 +86,6 @@ export interface QoderSubscriberStatus {
   allowByok: number
   teamAllowByok?: number
   isPrivacyPolicyModifiable?: boolean
-  /** @deprecated Raw provider responses are no longer returned; use normalized fields. */
   raw?: unknown
 }
 
