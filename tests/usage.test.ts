@@ -429,6 +429,43 @@ test('QoderUsageReader normalizes dedicated resource packages and skips unusable
   assert.equal(second.expiresAt, undefined)
 })
 
+test('QoderUsageReader tolerates an out-of-range expiry instead of failing the account read', async () => {
+  // int64 max is the provider's "never expires" sentinel and sits far outside
+  // the Date range, so it must degrade to "no expiry" rather than throw.
+  const payload = {
+    userQuota: { total: 3000, used: 3000, remaining: 0, percentage: 1, unit: 'credits' },
+    expiresAt: 9_223_372_036_854_775_807,
+    dedicatedResourcePackages: [
+      {
+        id: 'pkg-never',
+        total: 2000,
+        used: 10,
+        remaining: 1990,
+        expiresAt: 9_223_372_036_854_775_807,
+      },
+    ],
+  }
+  const fetchMock = async (input: RequestInfo | URL): Promise<Response> => {
+    const url = String(input)
+    if (url.includes('/jobToken/exchange')) return new Response(JSON.stringify({ token: 'jt-sentinel' }))
+    if (url.includes('/userinfo')) return new Response(JSON.stringify({ id: 'user-sentinel' }))
+    if (url.includes('/quota/usage')) return new Response(JSON.stringify(payload))
+    throw new Error(`unexpected URL: ${url}`)
+  }
+  const authService = new QoderAuthService({
+    fetch: fetchMock as typeof fetch,
+    resolveMachineId: () => 'machine-test',
+  })
+  const reader = new QoderUsageReader({ authService, fetch: fetchMock as typeof fetch })
+
+  const account = await reader.readAccount('pt-sentinel')
+  assert.equal(account.usage?.expiresAt, undefined)
+  const [pkg] = account.usage?.dedicatedResourcePackages ?? []
+  assert.equal(pkg?.expiresAt, undefined)
+  assert.equal(pkg?.remaining, 1990)
+  assert.equal(account.usage?.userQuota?.total, 3000)
+})
+
 test('QoderUsageReader omits dedicated resource packages for an absent or non-array field', async () => {
   let payload: Record<string, unknown> = { userQuota: { total: 10, used: 1, remaining: 9 } }
   const fetchMock = async (input: RequestInfo | URL): Promise<Response> => {

@@ -89,16 +89,22 @@ function normalizeQuota(raw?: RawQuota): QoderQuota | undefined {
 }
 
 
+/**
+ * Normalize an epoch-millis (or parseable date string) expiry to ISO-8601.
+ *
+ * The provider uses the int64 maximum as a "never expires" sentinel, which is
+ * outside the `Date` range: an unusable value resolves to `undefined` instead
+ * of throwing, so one bad field cannot abort the whole account read.
+ */
 function normalizeExpiresAt(rawExpires?: number | string): string | undefined {
   if (rawExpires === undefined || rawExpires === null) return undefined
-  if (typeof rawExpires === 'number' && rawExpires > 0) {
-    return new Date(rawExpires).toISOString()
-  }
-  if (typeof rawExpires === 'string' && rawExpires.length > 0) {
-    const parsed = Date.parse(rawExpires)
-    if (!Number.isNaN(parsed) && parsed > 0) return new Date(parsed).toISOString()
-  }
-  return undefined
+  const parsed = typeof rawExpires === 'number'
+    ? rawExpires
+    : (typeof rawExpires === 'string' && rawExpires.length > 0 ? Date.parse(rawExpires) : Number.NaN)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  const date = new Date(parsed)
+  if (!Number.isFinite(date.getTime())) return undefined
+  return date.toISOString()
 }
 
 function asString(value: unknown): string | undefined {
