@@ -14,6 +14,9 @@ import type {
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import { SettingsProvider, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import * as plugin from '../src/index.ts'
+import type { QoderFetchRoute } from '../src/dsh/rpc.ts'
+import type { QoderAccountInfo } from '../src/qoder/account.ts'
+import { QoderAuthService } from '../src/qoder/transport/auth.ts'
 
 class MemorySettings extends SettingsProvider {
   readonly writable = true
@@ -237,6 +240,124 @@ test('apply mounts the settings RPC on the connection Fetch registry', async () 
     '/api/qoder-subscription/account',
     '/api/qoder-subscription/models',
   ])
+})
+
+test('the account Fetch route serializes normalized metadata without raw provider payloads', async (t) => {
+  // Keep authentication and network fully synthetic, but exercise the real
+  // registered route, plugin handler, transport, and account normalizers.
+  t.mock.method(QoderAuthService.prototype, 'getCredentials', async (pat: string) => {
+    assert.equal(pat, 'pt-account-route-test')
+    return {
+      userID: 'user-account-route-test',
+      authToken: 'jt-account-route-test',
+      name: 'Account Route Test',
+      email: 'account-route@example.test',
+      machineID: 'machine-account-route-test',
+    }
+  })
+  const fetched: string[] = []
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL) => {
+    const url = String(input)
+    fetched.push(url)
+    if (url.includes('/quota/usage')) return Response.json({
+      userQuota: { total: 100, used: 20, remaining: 80, unit: 'credits' },
+      internalCampaignMetadata: { value: 'usage-internal-marker' },
+      dedicatedResourcePackages: [{
+        id: 'package-account-route-test',
+        name: 'campaign-internal-marker',
+        description: 'grant-internal-marker',
+        unknownMetadata: { value: 'package-internal-marker' },
+        total: 2000,
+        used: 1425,
+        remaining: 575,
+        percentage: 0.72,
+        unit: 'credits',
+        available: true,
+        status: 'QUOTA_DETAIL_STATUS_ACTIVE',
+        expiresAt: 1789790399000,
+        displayLabels: [{
+          dimension: 'title',
+          value: 'SOTA credits',
+          valueI18n: { 'zh-CN': 'SOTA 专属积分', 'en-US': 'SOTA Exclusive Credits' },
+        }],
+      }],
+    })
+    if (url.includes('/user/plan')) return Response.json({
+      user_type: 'pro',
+      plan_tier_name: 'Pro',
+      is_personal_version: true,
+      feature_allowed: { code_review: true },
+      internalCampaignMetadata: { value: 'plan-internal-marker' },
+    })
+    if (url.includes('/user/status')) return Response.json({
+      featureSwitches: { allow_byok: 2 },
+      teamSwitches: { allow_byok: 1 },
+      isPrivacyPolicyModifiable: true,
+      internalCampaignMetadata: { value: 'status-internal-marker' },
+    })
+    throw new Error(`unexpected URL: ${url}`)
+  })
+
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(TestCredentials)
+  await ctx.plugin(MemorySettings).await()
+  t.mock.method(ctx.credentials, 'resolve', async () => ({ value: 'pt-account-route-test', source: 'file' }))
+  const routes: QoderFetchRoute[] = []
+  ctx.provide('connection', {
+    fetch: { register: (route: QoderFetchRoute) => {
+      routes.push(route)
+      return () => {}
+    } },
+  } as any)
+  ctx.provide('attachments', {} as any)
+  await ctx.plugin({ name: plugin.name, inject: plugin.inject, apply: plugin.apply }, {}).await()
+
+  const route = routes.find(candidate => candidate.path === '/api/qoder-subscription/account')
+  assert.ok(route)
+  const response = await route.fetch(new Request(`http://127.0.0.1${route.path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ force: true }),
+  }))
+  assert.equal(response.status, 200)
+  const serialized = await response.text()
+  const result = JSON.parse(serialized) as { ok: boolean; value: QoderAccountInfo }
+  assert.equal(result.ok, true)
+  const account = result.value
+  assert.deepEqual(account.profile, {
+    id: 'user-account-route-test', name: 'Account Route Test', email: 'account-route@example.test',
+  })
+  assert.ok(account.usage)
+  assert.ok(account.plan)
+  assert.ok(account.status)
+  assert.equal(Object.hasOwn(account.usage, 'raw'), false)
+  assert.equal(Object.hasOwn(account.plan, 'raw'), false)
+  assert.equal(Object.hasOwn(account.status, 'raw'), false)
+  assert.doesNotMatch(serialized, /internalCampaignMetadata|unknownMetadata|(?:usage|campaign|grant|package|plan|status)-internal-marker/u)
+  assert.deepEqual(account.usage.userQuota, { total: 100, used: 20, remaining: 80, percentage: 20, unit: 'credits' })
+  assert.deepEqual(account.usage.dedicatedResourcePackages, [{
+    id: 'package-account-route-test',
+    title: {
+      values: { 'zh-CN': 'SOTA 专属积分', 'en-US': 'SOTA Exclusive Credits' },
+      fallback: 'SOTA credits',
+    },
+    total: 2000,
+    used: 1425,
+    remaining: 575,
+    percentage: 72,
+    unit: 'credits',
+    available: true,
+    status: 'QUOTA_DETAIL_STATUS_ACTIVE',
+    expiresAt: new Date(1789790399000).toISOString(),
+  }])
+  assert.equal(account.plan.userType, 'pro')
+  assert.equal(account.plan.planTierName, 'Pro')
+  assert.equal(account.plan.featureAllowed?.codeReview, true)
+  assert.deepEqual(account.status, { allowByok: 2, teamAllowByok: 1, isPrivacyPolicyModifiable: true })
+  assert.equal(fetched.filter(url => url.includes('/quota/usage')).length, 1)
+  assert.equal(fetched.filter(url => url.includes('/user/plan')).length, 1)
+  assert.equal(fetched.filter(url => url.includes('/user/status')).length, 1)
 })
 
 test('apply survives a connection service without a Fetch registry', async () => {

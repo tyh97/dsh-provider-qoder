@@ -250,6 +250,7 @@ test('QoderUsageReader reads subscriber plan and user status with machine finger
         JSON.stringify({
           user_type: 'pro',
           plan_tier_name: 'Pro',
+          internalMetadata: 'internal-plan-only',
           is_personal_version: false,
           is_highest_tier: true,
           start_date: 1700000000000,
@@ -274,7 +275,7 @@ test('QoderUsageReader reads subscriber plan and user status with machine finger
       statusHeaders = init?.headers as Record<string, string>
       return new Response(
         JSON.stringify({
-          featureSwitches: { allow_byok: 2 },
+          featureSwitches: { allow_byok: 2, internalFlag: 'internal-status-only' },
           teamSwitches: { allow_byok: 2 },
           isPrivacyPolicyModifiable: true,
         }),
@@ -305,6 +306,11 @@ test('QoderUsageReader reads subscriber plan and user status with machine finger
   assert.equal(account.status?.allowByok, 2)
   assert.equal(account.status?.teamAllowByok, 2)
   assert.equal(account.status?.isPrivacyPolicyModifiable, true)
+  assert.ok(account.plan)
+  assert.ok(account.status)
+  assert.equal(Object.hasOwn(account.plan, 'raw'), false)
+  assert.equal(Object.hasOwn(account.status, 'raw'), false)
+  assert.doesNotMatch(JSON.stringify(account), /internal-(?:plan|status)-only/u)
 
   assert.equal(planHeaders?.authorization, 'Bearer jt-plan-test')
   assert.equal(statusHeaders?.authorization, 'Bearer jt-plan-test')
@@ -321,6 +327,7 @@ test('QoderUsageReader reads subscriber plan and user status with machine finger
 test('QoderUsageReader normalizes dedicated resource packages and skips unusable entries', async () => {
   const usagePayload = {
     userId: 'user-pkg',
+    internalMetadata: 'internal-usage-only',
     userType: 'teams',
     totalUsagePercentage: 0.89,
     isQuotaExceeded: false,
@@ -411,8 +418,11 @@ test('QoderUsageReader normalizes dedicated resource packages and skips unusable
   assert.equal(first.title?.values['en-US'], 'SOTA Exclusive Credits')
   assert.equal(first.description?.fallback, 'sota model series description')
   assert.equal(first.description?.values['zh-CN'], 'SOTA 专属积分：在模型选择器中选择 Sonus 模型时优先抵扣该积分。')
-  // The internal growth-campaign identifiers must never ride the normalized copy.
-  assert.doesNotMatch(JSON.stringify(packages), /act-20260918-468/u)
+  // Check the complete account: a raw payload must not bypass normalization.
+  assert.ok(account.usage)
+  assert.equal(Object.hasOwn(account.usage, 'raw'), false)
+  assert.doesNotMatch(JSON.stringify(account), /act-20260918-468|growth-campaign:|internal-usage-only/u)
+  assert.equal(await reader.readAccount('pt-package-test'), account)
 
   assert.equal(second.id, 'pkg-0002')
   assert.equal(second.total, 500)
@@ -422,6 +432,73 @@ test('QoderUsageReader normalizes dedicated resource packages and skips unusable
   assert.equal(second.title, undefined)
   assert.equal(second.description, undefined)
   assert.equal(second.expiresAt, undefined)
+})
+
+test('QoderUsageReader omits invalid expiries without losing account data or dedicated resource packages', async () => {
+  const cases: { raw: string; expected?: string }[] = [
+    { raw: '9223372036854775807' },
+    { raw: '8640000000000001' },
+    // Valid JSON can decode to Infinity, even though JSON.stringify cannot emit it.
+    { raw: '1e400' },
+    { raw: '-1e400' },
+    { raw: '0' },
+    { raw: '-1' },
+    { raw: 'null' },
+    { raw: 'true' },
+    { raw: '{}' },
+    { raw: '[]' },
+    { raw: '""' },
+    { raw: '"not-a-date"' },
+    { raw: '"+275760-09-14T00:00:00.000Z"' },
+    { raw: '1789790399000', expected: '2026-09-19T03:59:59.000Z' },
+    { raw: '"2026-09-19T11:59:59+08:00"', expected: '2026-09-19T03:59:59.000Z' },
+    { raw: '8640000000000000', expected: '+275760-09-13T00:00:00.000Z' },
+  ]
+  let rawExpiry = 'null'
+  const fetchMock = async (input: RequestInfo | URL): Promise<Response> => {
+    const url = String(input)
+    if (url.includes('/jobToken/exchange')) return Response.json({ token: 'jt-expiry-test' })
+    if (url.includes('/userinfo')) return Response.json({ id: 'user-expiry-test', name: 'Expiry Test' })
+    if (url.includes('/quota/usage')) {
+      return new Response(`{
+        "expiresAt": ${rawExpiry},
+        "userQuota": { "total": 100, "used": 20, "remaining": 80 },
+        "orgResourcePackage": { "cap": 50, "used": 5, "remaining": 45 },
+        "dedicatedResourcePackages": [
+          { "id": "package-under-test", "total": 10, "used": 2, "remaining": 8, "expiresAt": ${rawExpiry} },
+          { "id": "valid-package", "total": 20, "used": 20, "remaining": 0, "expiresAt": 1789790399000 }
+        ]
+      }`)
+    }
+    if (url.includes('/user/plan')) {
+      return new Response(`{ "user_type": "pro", "plan_tier_name": "Pro", "end_date": ${rawExpiry} }`)
+    }
+    if (url.includes('/user/status')) return Response.json({ featureSwitches: { allow_byok: 2 } })
+    throw new Error(`unexpected URL: ${url}`)
+  }
+  const authService = new QoderAuthService({ fetch: fetchMock as typeof fetch, resolveMachineId: () => 'machine-test' })
+  const reader = new QoderUsageReader({ authService, fetch: fetchMock as typeof fetch })
+
+  for (const { raw, expected } of cases) {
+    rawExpiry = raw
+    const account = await reader.readAccount('pt-expiry-test', { force: true })
+    assert.equal(account.profile.name, 'Expiry Test')
+    assert.equal(account.usage?.userQuota?.remaining, 80)
+    assert.equal(account.usage?.orgResourcePackage?.remaining, 45)
+    assert.equal(account.usage?.expiresAt, expected, raw)
+    assert.equal(account.plan?.planTierName, 'Pro')
+    assert.equal(account.plan?.endDate, expected, raw)
+    assert.equal(account.status?.allowByok, 2)
+    const packages = account.usage?.dedicatedResourcePackages
+    assert.ok(packages)
+    assert.equal(packages.length, 2)
+    assert.equal(packages[0].remaining, 8)
+    assert.equal(packages[0].expiresAt, expected, raw)
+    assert.equal(Object.hasOwn(packages[0], 'expiresAt'), expected !== undefined, raw)
+    assert.equal(packages[1].remaining, 0)
+    assert.equal(packages[1].expiresAt, '2026-09-19T03:59:59.000Z')
+    assert.equal(await reader.readAccount('pt-expiry-test'), account)
+  }
 })
 
 test('QoderUsageReader omits dedicated resource packages for an absent or non-array field', async () => {
