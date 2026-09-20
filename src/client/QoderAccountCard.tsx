@@ -32,6 +32,10 @@ function formatResetDate(dateStr?: string): string | undefined {
   })
 }
 
+/**
+ * Settings card for the Qoder subscription: credential state, subscriber
+ * profile, and every quota block the provider reports.
+ */
 export function QoderAccountCard({ operations, t, activeLocale }: QoderAccountCardProps) {
   const [credentialState, setCredentialState] = useState<CredentialViewState>({ status: 'loading' })
   const [accountState, setAccountState] = useState<AccountViewState>({ status: 'idle' })
@@ -102,6 +106,13 @@ export function QoderAccountCard({ operations, t, activeLocale }: QoderAccountCa
     )
   }
 
+  /**
+   * Render one quota block.
+   *
+   * `expiresAt` wins over `resetDate` when both are supplied, because a
+   * dedicated package expires on its own date rather than on the subscription
+   * reset horizon. A package with no size renders nothing.
+   */
   const renderQuota = (
     key: string,
     label: string,

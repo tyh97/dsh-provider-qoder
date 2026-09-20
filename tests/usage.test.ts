@@ -413,6 +413,11 @@ test('QoderUsageReader normalizes dedicated resource packages and skips unusable
   assert.equal(first.description?.values['zh-CN'], 'SOTA 专属积分：在模型选择器中选择 Sonus 模型时优先抵扣该积分。')
   // The internal growth-campaign identifiers must never ride the normalized copy.
   assert.doesNotMatch(JSON.stringify(packages), /act-20260918-468/u)
+  // ...nor the raw upstream echo that shares the payload sent to the client.
+  assert.doesNotMatch(JSON.stringify(account.usage), /act-20260918-468|growth-campaign/u)
+  const rawUsage = account.usage?.raw as Record<string, unknown> | undefined
+  assert.equal(rawUsage?.dedicatedResourcePackages, undefined)
+  assert.equal(rawUsage?.userType, 'teams')
 
   assert.equal(second.id, 'pkg-0002')
   assert.equal(second.total, 500)

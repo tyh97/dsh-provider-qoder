@@ -141,6 +141,10 @@ export function apply(ctx: ClientContext): void {
     const raw = rawT(key)
     return fill(raw, values)
   }
+  /**
+   * Read the live UI locale. Cards call this during render, so a language
+   * switch re-resolves provider copy instead of reusing a setup-time snapshot.
+   */
   const activeLocale = (): string => ctx.locale.getLocale().active
 
   ctx.slots.inject('settings.section', () => ctx.slots.register({

@@ -133,6 +133,13 @@ function findDisplayLabel(raw: unknown, dimension: string): unknown {
   return undefined
 }
 
+/**
+ * Normalize one `displayLabels` entry into language-tagged copy.
+ *
+ * The provider's value lives under `valueI18n`/`value_i18n`, keyed by language
+ * tag, plus `value` as the untagged fallback. An entry with neither is dropped
+ * rather than surfaced as an empty label.
+ */
 function normalizeLocalizedText(raw: unknown): QoderLocalizedText | undefined {
   if (!raw || typeof raw !== 'object') return undefined
   const obj = raw as Record<string, unknown>
@@ -149,6 +156,14 @@ function normalizeLocalizedText(raw: unknown): QoderLocalizedText | undefined {
   return { values, fallback: fallback ?? '' }
 }
 
+/**
+ * Normalize the dedicated (entitlement-scoped) resource packages.
+ *
+ * Copy is read from `displayLabels` only, never from `name`/`description`,
+ * which carry internal campaign identifiers. Entries without a usable size are
+ * dropped and a non-array value yields `undefined`, so an unexpected payload
+ * never fails the account read that also feeds the model catalog.
+ */
 function normalizeResourcePackages(raw: unknown): QoderResourcePackage[] | undefined {
   if (!Array.isArray(raw)) return undefined
   const packages: QoderResourcePackage[] = []
@@ -343,6 +358,14 @@ export class QoderUsageReader {
     }
   }
 
+  /**
+   * Read `GET /api/v2/quota/usage` and normalize it for the host/client seam.
+   *
+   * The `raw` echo keeps the upstream fields for diagnostics, but never
+   * `dedicatedResourcePackages`: those entries carry the campaign identifiers
+   * that the normalized list deliberately discards, and this payload crosses
+   * the seam into the browser.
+   */
   private async fetchUsage(jobToken: string, signal?: AbortSignal): Promise<QoderQuotaUsage> {
     const data = await openApiJsonRequest<RawUsageInfo>(this.fetchImpl, {
       url: getQoderUsageUrl(this.region),
@@ -355,6 +378,8 @@ export class QoderUsageReader {
     })
 
     const dedicatedResourcePackages = normalizeResourcePackages(data.dedicatedResourcePackages)
+    const rawUsage: RawUsageInfo = { ...data }
+    delete rawUsage.dedicatedResourcePackages
 
     return {
       userQuota: normalizeQuota(data.userQuota),
@@ -363,7 +388,7 @@ export class QoderUsageReader {
       totalUsagePercentage: typeof data.totalUsagePercentage === 'number' ? data.totalUsagePercentage : undefined,
       isQuotaExceeded: typeof data.isQuotaExceeded === 'boolean' ? data.isQuotaExceeded : false,
       expiresAt: normalizeExpiresAt(data.expiresAt),
-      raw: data,
+      raw: rawUsage,
     }
   }
 

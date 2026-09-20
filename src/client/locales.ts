@@ -151,6 +151,12 @@ function localeMatches(tag: string, requested: string, prefix: boolean): boolean
   return primary.length > 0 && normalized.split('-')[0] === primary
 }
 
+/**
+ * Return the first provider translation whose language tag matches the request.
+ *
+ * `prefix` decides whether a shared primary subtag counts as a match; blank
+ * translations are skipped so they cannot shadow a later usable one.
+ */
 function pickLocalizedValue(
   values: Readonly<Record<string, string>>,
   requested: string,
