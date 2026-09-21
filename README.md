@@ -53,7 +53,7 @@ Select the region matching your account, enter your Qoder PAT into the input box
 
 Fetching models uses the **saved PAT and service region**. If you switch accounts or regions, you need to fetch models again. The initial model catalog is only a candidate reference; actual available models are subject to account query results. Model multipliers, reasoning effort options, and image-input capability are provided by Qoder and may not be available for all models.
 
-The model picker refreshes Qoder metadata for enabled models when opened, with a five-minute cache after a successful fetch.
+The model picker refreshes Qoder metadata for enabled models when opened, with a five-minute cache after a successful fetch. When settings are writable, refreshed multipliers and capabilities are also synchronized to the saved catalog shown in **Custom Settings**, without enabling additional models. Failed refreshes retain the last known metadata.
 
 Choosing a context tier changes both the context budget DSH plans against and the tier a model request asks Qoder for; the tier marked **default** is the one Qoder would use on its own. The selector appears only for models that advertise more than one tier.
 
