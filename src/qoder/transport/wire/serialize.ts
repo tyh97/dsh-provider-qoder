@@ -8,7 +8,7 @@ import type { QoderWireMessage, QoderWireRequest } from './wire-types.ts'
 import { selectedContextTier, type QoderCatalogModel } from '../../catalog.ts'
 import type { QoderImageAttachments, QoderImageResolver } from './translate.ts'
 import type { CosyCredentials } from './cosy.ts'
-import { QoderTurnTracker, type QoderTurnIdentityMode } from './turn-identity.ts'
+import { QoderTurnTracker, type QoderCallKind } from './turn-identity.ts'
 
 function stableHash(prefix: string, ...inputs: string[]): string {
   const hash = crypto.createHash('sha256')
@@ -32,6 +32,18 @@ function stableHash(prefix: string, ...inputs: string[]): string {
 export const qoderTurnTracker = new QoderTurnTracker({ mode: 'request-set' })
 
 /**
+ * Whether this request serves the subscriber's turn or the host's bookkeeping.
+ *
+ * The host marks an auxiliary call through `GenerateOptions.purpose`, and those
+ * calls carry a message list of their own under the same session identity. They
+ * must never move the open turn's boundary, or one subscriber prompt would
+ * report two consumption records.
+ */
+function callKind(options: GenerateOptions): QoderCallKind {
+  return options.purpose === undefined ? 'conversation' : 'auxiliary'
+}
+
+/**
  * Turn id this request continues, or a per-request id when the request cannot
  * be attributed to a conversation because it carries no session identity.
  */
@@ -39,6 +51,7 @@ function turnRecordId(options: GenerateOptions, messages: readonly QoderWireMess
   return qoderTurnTracker.resolveTurnRecordId(
     options.sessionId === undefined ? undefined : String(options.sessionId),
     messages,
+    callKind(options),
   ) ?? `qoder-request-${crypto.randomUUID()}`
 }
 
@@ -177,6 +190,7 @@ export async function buildQoderRequestBody(
   const business = qoderTurnTracker.resolveBusinessId(
     options.sessionId === undefined ? undefined : String(options.sessionId),
     messages,
+    callKind(options),
   )
 
   return {

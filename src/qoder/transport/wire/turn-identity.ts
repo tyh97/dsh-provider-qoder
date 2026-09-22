@@ -32,23 +32,52 @@ import type { QoderWireMessage } from './wire-types.ts'
  */
 export type QoderTurnIdentityMode = 'request-set' | 'both' | 'chat-record'
 
+/**
+ * What a request is for.
+ *
+ * A conversation request continues, or opens, a subscriber turn. The host also
+ * routes its own auxiliary calls — session title, compaction summary — through
+ * the same provider with the same session identity but a message list of their
+ * own, and those must never move a turn's boundary.
+ */
+export type QoderCallKind = 'conversation' | 'auxiliary'
+
 /** Bounded per-session memory: one entry per conversation this process serves. */
 export interface QoderTurnTrackerOptions {
   /**
-   * Maximum remembered sessions. The least recently used conversation is
-   * evicted first; because an identity is rederived from the conversation, an
-   * evicted session resumes the same record rather than opening a second one.
+   * Maximum remembered sessions.
+   *
+   * A conversation idle for longer than `idleSessionTtlMs` is evicted first,
+   * because a session that has not been touched for that long cannot still be
+   * running a turn. Only when every recorded session is more recent than that
+   * does the ceiling apply, and then the coldest one is dropped — which can
+   * split one record, so the ceiling is deliberately far above the number of
+   * conversations a subscriber works on at once.
    */
   maxSessions?: number
+  /** How long a session may stay untouched before it becomes evictable. */
+  idleSessionTtlMs?: number
+  /**
+   * Clock the tracker reads.
+   *
+   * Injectable so a caller can advance time in a test instead of waiting for a
+   * real idle window.
+   */
+  now?: () => number
   /** Request field the turn identity is written to. Defaults to `request-set`. */
   mode?: QoderTurnIdentityMode
 }
 
 interface SessionTurnState {
-  /** Fingerprint of the input message the current record was opened by. */
-  anchor: string
-  /** Position of the anchor among the request's user-role messages. */
-  anchorIndex: number
+  /**
+   * How many times each user-role message has been accounted for by this turn.
+   *
+   * A turn is a multiset, not a position: later steps append context, history
+   * may be trimmed, and the translation layer adds image markers, so a message
+   * already seen belongs to the open record while a genuinely new occurrence of
+   * one opens the next.
+   */
+  readonly claimed: Map<string, number>
   /** Stable record id of that turn. */
   currentTurnId: string
   /**
@@ -61,6 +90,8 @@ interface SessionTurnState {
   currentBusinessId: string
   /** When that agent run opened, reported as `business.begin_at`. */
   turnOpenedAt: number
+  /** When this session last served a request, used only for eviction order. */
+  lastTouchedAt: number
   /**
    * Turns opened in this session.
    *
@@ -72,6 +103,17 @@ interface SessionTurnState {
 }
 
 const defaultMaxSessions = 64
+/** A conversation untouched for this long cannot still be mid-turn. */
+const defaultIdleSessionTtlMs = 60 * 60 * 1000
+
+/**
+ * Where one user-role wire message came from.
+ *
+ * `prompt` is input a subscriber sent. `injected` is context the host appends
+ * while a turn runs. `synthetic` is a marker this transport materializes while
+ * translating a turn's own tool results. Only `prompt` may open a turn.
+ */
+type QoderMessageOrigin = 'prompt' | 'injected' | 'synthetic'
 
 /**
  * Openings of everything the host appends while a turn runs.
@@ -91,11 +133,27 @@ const injectedContextOpenings: readonly string[] = [
   'Current runtime context. This snapshot supersedes earlier runtime-context',
   'This is an automatically generated checkpoint condensing',
   '[model changed:',
-  'Background subagent ',
   'background job ',
   'The approval policy changed',
-  'Agent ',
 ]
+
+/**
+ * Host messages that name their sender.
+ *
+ * A delegated agent's message and a settled background subagent both start with
+ * a word a subscriber may legitimately use, so they are matched on the host's
+ * own template — the sender's identity then a fixed phrase — instead of on a
+ * bare prefix that would swallow real prompts.
+ */
+const hostNotificationTemplate = /^(?:Agent|Background subagent) \S{3,} (?:sent a message:|finished\b)/
+
+/**
+ * Text this transport synthesizes while translating a turn's own tool results.
+ *
+ * A tool result carrying images becomes a user-role message, so it must be
+ * recognized as part of the open record rather than as new subscriber input.
+ */
+const syntheticMarkerTemplate = /^\[\d+ images? returned by the previous tool call\]/
 
 /** Wire text of one user message, used for injection classification. */
 function messageText(message: QoderWireMessage): string {
@@ -105,6 +163,14 @@ function messageText(message: QoderWireMessage): string {
   return content.map(part => part.type === 'text' ? part.text : '').join('')
 }
 
+/** Classify one user-role wire message. */
+function qoderMessageOrigin(message: QoderWireMessage): QoderMessageOrigin {
+  const text = messageText(message).trimStart()
+  if (syntheticMarkerTemplate.test(text)) return 'synthetic'
+  if (hostNotificationTemplate.test(text)) return 'injected'
+  return injectedContextOpenings.some(opening => text.startsWith(opening)) ? 'injected' : 'prompt'
+}
+
 /**
  * Whether one user-role message is host context rather than subscriber input.
  *
@@ -112,8 +178,7 @@ function messageText(message: QoderWireMessage): string {
  * transcripts, so the list cannot silently drift from what the host appends.
  */
 export function isInjectedQoderContext(message: QoderWireMessage): boolean {
-  const text = messageText(message).trimStart()
-  return injectedContextOpenings.some(opening => text.startsWith(opening))
+  return qoderMessageOrigin(message) !== 'prompt'
 }
 
 /** Stable record id of one session turn. */
@@ -165,12 +230,16 @@ function messageFingerprint(message: QoderWireMessage): string {
  */
 export class QoderTurnTracker {
   private readonly maxSessions: number
+  private readonly idleSessionTtlMs: number
+  private readonly now: () => number
   /** Request field the resolved turn id is written to. */
   readonly mode: QoderTurnIdentityMode
   private readonly sessions = new Map<string, SessionTurnState>()
 
   constructor(options: QoderTurnTrackerOptions = {}) {
     this.maxSessions = options.maxSessions ?? defaultMaxSessions
+    this.idleSessionTtlMs = options.idleSessionTtlMs ?? defaultIdleSessionTtlMs
+    this.now = options.now ?? Date.now
     this.mode = options.mode ?? 'request-set'
   }
 
@@ -180,54 +249,85 @@ export class QoderTurnTracker {
    * `null` means the request carries no session identity, so no conversation
    * identity can be derived and the caller must fall back to a per-request id.
    */
-  resolveTurnRecordId(sessionId: string | undefined, messages: readonly QoderWireMessage[]): string | null {
+  resolveTurnRecordId(
+    sessionId: string | undefined,
+    messages: readonly QoderWireMessage[],
+    kind: QoderCallKind = 'conversation',
+  ): string | null {
     if (sessionId === undefined || sessionId.length === 0) return null
 
     let state = this.sessions.get(sessionId)
     if (state === undefined) {
-      state = { anchor: '', anchorIndex: -1, currentTurnId: '', currentBusinessId: '', turnOpenedAt: 0, turnCount: 0 }
+      const now = this.now()
+      // Stamp the session before claiming it: the eviction pass must see this
+      // conversation as active, otherwise it evicts the entry it just created.
+      state = {
+        claimed: new Map(),
+        currentTurnId: '',
+        currentBusinessId: '',
+        turnOpenedAt: 0,
+        lastTouchedAt: now,
+        turnCount: 0,
+      }
       this.claimSession(sessionId, state)
     } else {
+      state.lastTouchedAt = this.now()
       // Refresh recency so eviction drops the coldest conversation.
       this.sessions.delete(sessionId)
       this.sessions.set(sessionId, state)
     }
 
-    // Host-appended context belongs to the open record and can never anchor a
-    // new one. The anchor is the last message carrying real input; its position
-    // is what separates a repeated prompt from the open record, because a turn's
-    // own later steps only ever append after the anchor, while a genuinely new
-    // prompt appears after everything the open record already contained.
-    let anchor: string | undefined
-    let anchorIndex = -1
-    let userIndex = 0
+    // A turn is a set of user-role messages with the number of times each one
+    // occurred, not a position among them: the harness appends its own context
+    // while a turn runs, trims history, and the translation layer adds image
+    // markers, none of which may move the record's boundary. Host-appended
+    // context, and everything an auxiliary call carries, never opens a turn —
+    // only input this request introduces for the first time does.
+    const present = new Map<string, { count: number; host: QoderMessageOrigin }>()
     for (const message of messages) {
       if (message.role !== 'user') continue
-      const index = userIndex++
-      if (isInjectedQoderContext(message)) continue
-      anchor = messageFingerprint(message)
-      anchorIndex = index
+      const fingerprint = messageFingerprint(message)
+      const entry = present.get(fingerprint)
+      if (entry === undefined) {
+        present.set(fingerprint, { count: 1, host: qoderMessageOrigin(message) })
+      } else {
+        entry.count += 1
+      }
     }
 
-    // A different anchor text is a new prompt. Identical text at a later
-    // position is also a new prompt — a subscriber who repeats the same words —
-    // and the ordinal keeps that record distinct from the previous one.
-    const openedTurn = anchor !== undefined
-      && (anchor !== state.anchor || anchorIndex > state.anchorIndex)
-    if (openedTurn && anchor !== undefined) {
-      state.anchor = anchor
-      state.anchorIndex = anchorIndex
+    let opening: string | undefined
+    let unclaimed = 0
+    for (const [fingerprint, entry] of present) {
+      const claimed = state.claimed.get(fingerprint) ?? 0
+      if (entry.count <= claimed) continue
+      if (kind === 'conversation') state.claimed.set(fingerprint, entry.count)
+      // Host-appended context and transport-synthesized markers join the open
+      // record. An unaccounted subscriber message is the only candidate for
+      // opening the next one, and exactly one such message means it did.
+      if (entry.host === 'injected' || entry.host === 'synthetic') continue
+      unclaimed += entry.count - claimed
+      opening = fingerprint
+    }
+
+    // Exactly one unaccounted subscriber message opens the next turn, so a
+    // subscriber who repeats the same words still gets a record of their own.
+    // Anything else — no new input, several at once, or host and transport
+    // messages — continues the open record. An auxiliary call never opens one:
+    // it serves no subscriber turn, so its message list must not displace the
+    // turn that is still running under the same session identity.
+    if (kind === 'conversation' && opening !== undefined && unclaimed === 1) {
       state.turnCount += 1
-      state.currentTurnId = turnIdFor(sessionId, state.turnCount, anchor)
+      state.currentTurnId = turnIdFor(sessionId, state.turnCount, opening)
       state.currentBusinessId = crypto.randomUUID()
-      state.turnOpenedAt = Date.now()
+      state.turnOpenedAt = this.now()
     } else if (state.currentTurnId === '') {
-      // A request without subscriber input still belongs to a record; it stays
-      // that record until the first real prompt arrives.
+      // A request without subscriber input still belongs to a record; it keeps
+      // that record until a real prompt arrives, and an auxiliary call never
+      // claims the record the subscriber's next prompt would open.
       state.turnCount += 1
       state.currentTurnId = turnIdFor(sessionId, state.turnCount, '')
       state.currentBusinessId = crypto.randomUUID()
-      state.turnOpenedAt = Date.now()
+      state.turnOpenedAt = this.now()
     }
 
     return state.currentTurnId
@@ -243,15 +343,20 @@ export class QoderTurnTracker {
   resolveBusinessId(
     sessionId: string | undefined,
     messages: readonly QoderWireMessage[],
+    kind: QoderCallKind = 'conversation',
   ): { businessId: string; beginAt: number } {
     if (sessionId !== undefined && sessionId.length > 0) {
-      this.resolveTurnRecordId(sessionId, messages)
+      this.resolveTurnRecordId(sessionId, messages, kind)
       const state = this.sessions.get(sessionId)
       if (state !== undefined && state.currentBusinessId !== '') {
+        // An auxiliary call reports a run of its own for exactly this request:
+        // adopting it would make the subscriber's own turn inherit the auxiliary
+        // call's record once that call returns.
+        if (kind === 'auxiliary') return { businessId: crypto.randomUUID(), beginAt: this.now() }
         return { businessId: state.currentBusinessId, beginAt: state.turnOpenedAt }
       }
     }
-    return { businessId: crypto.randomUUID(), beginAt: Date.now() }
+    return { businessId: crypto.randomUUID(), beginAt: this.now() }
   }
 
   /** Forget one session, e.g. when its transport is disposed. */
@@ -265,15 +370,32 @@ export class QoderTurnTracker {
   }
 
   private claimSession(sessionId: string, state: SessionTurnState): void {
+    // Re-insert first so the newest conversation is also the most recently used,
+    // then keep the recorded sessions bounded.
     this.sessions.set(sessionId, state)
-    // Evict the coldest conversations, keeping the identity being created.
+    this.evict()
+  }
+
+  /**
+   * Keep the recorded sessions bounded.
+   *
+   * A conversation untouched for longer than the idle TTL cannot still be
+   * running a turn, so it is evicted first and dropping it can never split a
+   * record. Only when no session is that idle does the ceiling drop the coldest
+   * one, which can split the turn that conversation was running.
+   */
+  private evict(): void {
+    const idleBefore = this.now() - this.idleSessionTtlMs
+    for (const [id, state] of this.sessions) {
+      if (this.sessions.size <= this.maxSessions) return
+      if (state.lastTouchedAt <= idleBefore) this.sessions.delete(id)
+    }
+    // Every remaining session is active, so the ceiling wins over protection.
     while (this.sessions.size > this.maxSessions) {
       const oldest = this.sessions.keys().next()
       if (oldest.done === true) return
       this.sessions.delete(oldest.value)
     }
-    // Re-insert so the newest conversation is also the most recently used.
-    this.sessions.delete(sessionId)
-    this.sessions.set(sessionId, state)
   }
 }
+

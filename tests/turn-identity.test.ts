@@ -91,7 +91,7 @@ test('mid-turn messages that are not a new prompt stay in the open record', () =
   const tracker = new QoderTurnTracker()
   const session = 'identity-session-3'
   const prompt = wireUser('Review this change')
-  const parentMessage = wireUser('Agent 123 sent a message: also check the retry path')
+  const parentMessage = wireUser('Agent 32b2b19f-2a36-4b22-95e1-98700c0fa5af sent a message: also check the retry path')
 
   const first = tracker.resolveTurnRecordId(session, [prompt])
   const second = tracker.resolveTurnRecordId(session, [prompt, injected('memory')])
@@ -128,10 +128,11 @@ test('host-injected context of every known shape stays inside the turn', () => {
     wireUser('<openviking-context>Relevant memory from OpenViking</openviking-context>'),
     wireUser('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.'),
     wireUser('[model changed: provider/model]'),
-    wireUser('Background subagent abc finished'),
+    wireUser('Background subagent 08842bb5-05d5-46a9-ba72-98555f48c4e2 finished'),
     wireUser('background job pwsh-1 completed'),
     wireUser('This is an automatically generated checkpoint condensing the session'),
     wireUser('<goal_complete>Objective reached</goal_complete>'),
+    wireUser('[2 images returned by the previous tool call]'),
   ]
 
   const first = tracker.resolveTurnRecordId(session, [prompt])
@@ -207,6 +208,73 @@ test('the tracker mode selects which field carries the turn id', async () => {
   assert.notEqual(first.chat_record_id, second.chat_record_id)
 })
 
+test('an auxiliary host call never moves the open turn', async () => {
+  const session = 'identity-session-auxiliary'
+  const prompt = user('Refactor the parser')
+  const opening = await buildQoderRequestBody(options([prompt], session), 'user-42')
+
+  // Session title and compaction summary are routed through this provider with
+  // the same session identity but a message list of their own.
+  const [titleBody, summaryBody] = await Promise.all([
+    buildQoderRequestBody({
+      ...options([user('Generate the session title from this JSON array of human messages:')], session),
+      purpose: 'session-title',
+    } as GenerateOptions, 'user-42'),
+    buildQoderRequestBody({
+      ...options([prompt, user('You are now acting as a compaction engine for this AI coding assistant.')], session),
+      purpose: 'compaction',
+    } as GenerateOptions, 'user-42'),
+  ])
+  const continuation = await buildQoderRequestBody(options([prompt, user('Next prompt')], session), 'user-42')
+
+  // The auxiliary calls stay outside the turn instead of stealing it.
+  assert.notEqual(titleBody.business.id, opening.business.id)
+  assert.notEqual(summaryBody.business.id, opening.business.id)
+  // The subscriber's own next prompt still opens a turn of its own.
+  assert.notEqual(continuation.business.id, opening.business.id)
+  assert.notEqual(continuation.business.id, titleBody.business.id)
+})
+
+test('a step that adds the transport image marker keeps the same turn', async () => {
+  const session = 'identity-session-image-marker'
+  const prompt = user('Describe this screenshot')
+  const first = await buildQoderRequestBody(options([prompt], session), 'user-42')
+  // The translation layer materializes tool-result images as a user-role
+  // message, so an image-returning tool must not split the turn.
+  const second = await buildQoderRequestBody(options([
+    prompt,
+    user('[1 image returned by the previous tool call]'),
+  ], session), 'user-42')
+
+  assert.equal(second.business.id, first.business.id)
+  assert.equal(second.request_set_id, first.request_set_id)
+})
+
+test('a subscriber prompt that repeats host wording still opens a new turn', async () => {
+  const session = 'identity-session-wording'
+  const first = await buildQoderRequestBody(options([user('Fix the build')], session), 'user-42')
+  // "Agent " prefixes host notifications, but a subscriber may write it too.
+  const second = await buildQoderRequestBody(options([
+    user('Fix the build'),
+    user('Agent 请继续处理剩下的改动'),
+  ], session), 'user-42')
+
+  assert.notEqual(second.business.id, first.business.id)
+})
+
+test('trimming history keeps the open turn', async () => {
+  const session = 'identity-session-trim'
+  const prompt = user('Investigate the failure')
+  const followUp = user('And now the retry path')
+  const first = await buildQoderRequestBody(options([prompt, followUp], session), 'user-42')
+  // Compaction may drop the earlier messages; the surviving input still belongs
+  // to the record it already opened.
+  const trimmed = await buildQoderRequestBody(options([followUp], session), 'user-42')
+
+  assert.equal(trimmed.business.id, first.business.id)
+  assert.equal(trimmed.request_set_id, first.request_set_id)
+})
+
 test('repeating the same prompt still opens a distinct record per turn', () => {
   const tracker = new QoderTurnTracker()
   const session = 'identity-session-repeat'
@@ -225,18 +293,48 @@ test('repeating the same prompt still opens a distinct record per turn', () => {
   )
 })
 
-test('the tracker keeps a bounded, deterministic per-session identity', () => {
-  const tracker = new QoderTurnTracker({ maxSessions: 2 })
+test('the tracker keeps a bounded per-session identity and prefers idle sessions', () => {
+  // Active sessions outnumber the ceiling: the ceiling has to win, so the
+  // coldest conversation loses its state and reports a new agent run.
+  const busy = new QoderTurnTracker({ maxSessions: 2, idleSessionTtlMs: 0 })
+  const kept = busy.resolveBusinessId('identity-keep', [wireUser('keep')])
+  const other = busy.resolveBusinessId('identity-other', [wireUser('other')])
+  assert.equal(busy.resolveBusinessId('identity-keep', [wireUser('keep')]).businessId, kept.businessId)
+  busy.resolveBusinessId('identity-third', [wireUser('third')])
 
-  const kept = tracker.resolveTurnRecordId('identity-keep', [wireUser('keep')])
-  const other = tracker.resolveTurnRecordId('identity-other', [wireUser('other')])
-  // Touch the first session so the second becomes the coldest.
-  assert.equal(tracker.resolveTurnRecordId('identity-keep', [wireUser('keep')]), kept)
-  tracker.resolveTurnRecordId('identity-third', [wireUser('third')])
+  assert.equal(busy.resolveBusinessId('identity-keep', [wireUser('keep')]).businessId, kept.businessId)
+  assert.notEqual(busy.resolveBusinessId('identity-other', [wireUser('other')]).businessId, other.businessId)
 
-  // The most recently used conversation keeps its record.
-  assert.equal(tracker.resolveTurnRecordId('identity-keep', [wireUser('keep')]), kept)
-  // A conversation whose state was evicted rederives the same record from the
-  // conversation itself, so eviction can never split one turn into two records.
-  assert.equal(tracker.resolveTurnRecordId('identity-other', [wireUser('other')]), other)
+  // A conversation idle past the TTL is evicted before any active one, so a turn
+  // that is still running is never split by the ceiling.
+  let clock = 1_000_000
+  const idle = new QoderTurnTracker({ maxSessions: 2, idleSessionTtlMs: 60_000, now: () => clock })
+  const active = idle.resolveBusinessId('identity-active', [wireUser('active')])
+  idle.resolveBusinessId('identity-stale', [wireUser('stale')])
+  // Age the clock past the TTL, then touch the active conversation and add one.
+  clock += 120_000
+  idle.resolveBusinessId('identity-active', [wireUser('active')])
+  idle.resolveBusinessId('identity-third', [wireUser('third')])
+
+  assert.equal(idle.resolveBusinessId('identity-third', [wireUser('third')]).businessId.length, 36)
+  assert.equal(idle.resolveBusinessId('identity-active', [wireUser('active')]).businessId, active.businessId)
+})
+
+test('the business id is stable for a turn and renews for the next one', () => {
+  const tracker = new QoderTurnTracker({ mode: 'both' })
+  const session = 'identity-session-business-tracker'
+  const first = tracker.resolveBusinessId(session, [wireUser('One')])
+  const stillOpen = tracker.resolveBusinessId(session, [wireUser('One'), injected('context')])
+  const next = tracker.resolveBusinessId(session, [wireUser('One'), injected('context'), wireUser('Two')])
+
+  assert.equal(stillOpen.businessId, first.businessId)
+  assert.equal(stillOpen.beginAt, first.beginAt)
+  assert.notEqual(next.businessId, first.businessId)
+  // An auxiliary call never opens or replaces a run.
+  const auxiliary = tracker.resolveBusinessId(session, [wireUser('Generate the session title')], 'auxiliary')
+  assert.notEqual(auxiliary.businessId, next.businessId)
+  assert.equal(
+    tracker.resolveBusinessId(session, [wireUser('One'), injected('context'), wireUser('Two')]).businessId,
+    next.businessId,
+  )
 })
