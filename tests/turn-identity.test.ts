@@ -225,11 +225,16 @@ test('an auxiliary host call never moves the open turn', async () => {
       purpose: 'compaction',
     } as GenerateOptions, 'user-42'),
   ])
+  // The step after an auxiliary call still belongs to the subscriber's turn: the
+  // auxiliary call must not have displaced the record it was riding alongside.
+  const stepAfterAux = await buildQoderRequestBody(options([prompt], session), 'user-42')
   const continuation = await buildQoderRequestBody(options([prompt, user('Next prompt')], session), 'user-42')
 
   // The auxiliary calls stay outside the turn instead of stealing it.
   assert.notEqual(titleBody.business.id, opening.business.id)
   assert.notEqual(summaryBody.business.id, opening.business.id)
+  assert.equal(stepAfterAux.business.id, opening.business.id)
+  assert.equal(stepAfterAux.request_set_id, opening.request_set_id)
   // The subscriber's own next prompt still opens a turn of its own.
   assert.notEqual(continuation.business.id, opening.business.id)
   assert.notEqual(continuation.business.id, titleBody.business.id)

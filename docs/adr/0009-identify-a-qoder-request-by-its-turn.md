@@ -13,9 +13,11 @@ The turn boundary is derived in `qoder/transport/wire/turn-identity.ts`, because
 
 - The harness appends its own context (workspace instructions, runtime context, memory recall, model-change notices, background notifications, checkpoint markers, delegated agents' messages) while the turn runs.
 - History can be trimmed, which moves any message's position and can drop the anchor itself.
-- The translation layer materializes a turn's own tool-result images as a user-role message, and published image URLs may change within a turn.
+- The translation layer materializes a turn's own tool-result images as a user-role message, and published image URLs are re-signed as their cache entries expire.
 
-An unaccounted subscriber message opens the next turn; everything else continues the open record. Host-appended context and transport-synthesized markers are recognized as such, and the two host notifications whose wording a subscriber may legitimately reuse (`Agent <id> sent a message:`, `Background subagent <id> finished`) are matched on the host's own template — sender identity plus fixed phrase — rather than on a bare prefix that would swallow real prompts.
+An unaccounted subscriber message opens the next turn; everything else continues the open record. Host-appended context and transport-synthesized markers are recognized as such, and the two host notifications whose wording a subscriber may legitimately reuse (`Agent <id> sent a message:`, `Background subagent <id> finished`) are matched on the host's own template — sender identity plus fixed phrase — rather than on a bare prefix that would swallow real prompts. Occurrences a request no longer carries are forgotten, and image URLs are excluded from a message's fingerprint so re-signing cannot make a turn's own prompt look like new input.
+
+Known limit: because the host's message ids are not part of the wire shape, text identifies a message. A subscriber who sends the same words twice with the first copy already gone from history — compaction replaced that span — shares the open record instead of opening a new one. Carrying `Message.id` through translation is the fix, and it needs the adapter to receive it.
 
 The host routes its own auxiliary calls — session title and compaction summary — through this provider under the same session identity with a message list of their own, and marks them through `GenerateOptions.purpose`. They report a run of their own for exactly that request: they never open a turn, never claim the record the subscriber's next prompt would open, and never displace the run that is still in flight.
 
